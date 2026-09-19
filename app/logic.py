@@ -4,7 +4,8 @@
 - 业务时间（valid time）  [valid_from, valid_to)：费率在现实中生效的区间，左闭右开；
 - 系统时间（system time） [recorded_at, superseded_at)：该记录被系统认知为真的区间，左闭右开。
 
-修订 = 追加新版本并把被覆盖的旧版本标记 superseded_at，历史行永不修改、永不删除。
+修订 = 追加新版本，把与新区间相交的旧版本标记 superseded_at，并把旧版本
+未被覆盖的左右残段按原费率/reason 追加为补偿版本；历史行永不修改、永不删除。
 """
 
 import math
@@ -43,13 +44,21 @@ def record_rate(
     recorded_at: Optional[datetime],
     reason: Optional[str],
     conn: Optional[sqlite3.Connection] = None,
-) -> tuple[sqlite3.Row, list[int]]:
+) -> tuple[sqlite3.Row, list[int], list[sqlite3.Row]]:
     """录入费率（追加式）。
 
-    若新区间与当前认知中（superseded_at IS NULL）的既有版本重叠，
-    则将重叠旧版本在 recorded_at 时刻标记为被取代，再插入新版本。
+    若新区间 [vf, vt) 与当前认知中（superseded_at IS NULL）的既有版本相交，
+    对每条被覆盖的旧版本只**取代交集**：旧版本在 recorded_at 时刻整体标记为
+    被取代，再把其业务区间中未被新区间覆盖的左、右残段按原费率与原 reason
+    追加为补偿版本（recorded_at 同为本次修订时刻）。这样新区间之外原本有效
+    的报价不会因修订而变成 gap。开放上界（valid_to IS NULL）的旧版本同理，
+    其右残段仍保持开放上界。
 
-    返回 (新版本行, 被取代的版本 id 列表)。
+    取代标记、新版本与补偿片段在同一事务内完成：先标记取代，再创建新版本，
+    最后按 valid_from 升序插入补偿片段；新版本号取 max(version)+1，补偿片段
+    版本号严格递增。历史行永不修改、永不删除，历史 known_at 仍可回放原版本。
+
+    返回 (新版本行, 被取代的版本 id 列表, 补偿版本行列表（按版本号升序）)。
     """
     vf = iso(valid_from)
     vt = iso(valid_to) if valid_to is not None else None
@@ -74,33 +83,74 @@ def record_rate(
             )
 
         overlaps = conn.execute(
-            "SELECT id FROM rate_versions "
+            "SELECT * FROM rate_versions "
             "WHERE contract_no = ? AND superseded_at IS NULL "
             "  AND valid_from < COALESCE(?, ?) "
             "  AND COALESCE(valid_to, ?) > ?",
             (contract_no, vt, INF, INF, vf),
         ).fetchall()
 
-        superseded_ids = [row["id"] for row in overlaps]
+        # 先在事务外（写入前）规划每条旧版本的左/右补偿残段。
+        # 残段区间均为左闭右开：左残段 [old.vf, new.vf)，右残段 [new.vt, old.vt)；
+        # old.vt 为 NULL 时右残段保持开放上界；新区间无终点时不可能有右残段。
+        fragments = []  # (frag_from, frag_to, old_row)
+        for old in overlaps:
+            old_vf, old_vt = old["valid_from"], old["valid_to"]
+            if old_vf < vf:
+                fragments.append((old_vf, vf, old))
+            if vt is not None and (old_vt is None or old_vt > vt):
+                fragments.append((vt, old_vt, old))
+        # 补偿片段按 valid_from 升序；同一时刻以旧版本 id 兜底（脏数据场景也确定）
+        fragments.sort(key=lambda item: (item[0], item[2]["id"]))
+
+        superseded_ids = [old["id"] for old in overlaps]
+        next_version = state["max_v"] + 1
+
+        # 1) 先标记被取代的旧版本（仅其与新区间相交的部分被新版本覆盖，
+        #    未覆盖部分由下面的补偿版本承接）
         for version_id in superseded_ids:
             conn.execute(
                 "UPDATE rate_versions SET superseded_at = ? WHERE id = ?",
                 (ra, version_id),
             )
 
+        # 2) 创建新费率版本
         cursor = conn.execute(
             "INSERT INTO rate_versions "
             "(contract_no, rate, valid_from, valid_to, recorded_at, version, reason) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (contract_no, rate, vf, vt, ra, state["max_v"] + 1, reason),
+            (contract_no, rate, vf, vt, ra, next_version, reason),
         )
         new_row = conn.execute(
             "SELECT * FROM rate_versions WHERE id = ?", (cursor.lastrowid,)
         ).fetchone()
 
+        # 3) 按 valid_from 升序追加补偿版本，版本号严格递增；费率与 reason 沿用原版本
+        retained_rows = []
+        for i, (frag_vf, frag_vt, old) in enumerate(fragments, start=1):
+            cursor = conn.execute(
+                "INSERT INTO rate_versions "
+                "(contract_no, rate, valid_from, valid_to, recorded_at, version, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    contract_no,
+                    old["rate"],
+                    frag_vf,
+                    frag_vt,
+                    ra,
+                    next_version + i,
+                    old["reason"],
+                ),
+            )
+            retained_rows.append(
+                conn.execute(
+                    "SELECT * FROM rate_versions WHERE id = ?", (cursor.lastrowid,)
+                ).fetchone()
+            )
+
         if own_conn:
             conn.commit()
-        return new_row, superseded_ids
+        return new_row, superseded_ids, retained_rows
     finally:
         if own_conn:
             conn.close()

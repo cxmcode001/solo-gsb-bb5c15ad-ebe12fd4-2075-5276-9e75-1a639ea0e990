@@ -99,6 +99,8 @@ def test_revision_appends_version_and_keeps_history(client):
     body = r2.json()
     assert body["created"]["version"] == 2
     assert len(body["superseded_rate_ids"]) == 1
+    # 新区间与旧区间完全重合：没有未覆盖残段
+    assert body["retained_versions"] == []
 
     # 修订前的认知时点：仍看到旧费率 0.05
     old = client.get("/quote", params={
@@ -140,11 +142,279 @@ def test_partial_overlap_revision(client):
                   recorded_at="2026-03-01T00:00:00Z")
     assert len(r.json()["superseded_rate_ids"]) == 2
     assert r.json()["created"]["version"] == 3
+    assert r.json()["retained_versions"] == []
 
     q = client.get("/quote", params={
         "contract_no": "C-5", "valid_at": "2026-08-01T00:00:00Z",
         "known_at": "2026-03-02T00:00:00Z"})
     assert q.json()["rate"] == 0.09
+
+
+def _timeline(client, contract):
+    r = client.get(f"/contracts/{contract}/timeline")
+    assert r.status_code == 200
+    return r.json()["versions"]
+
+
+def test_middle_overlap_creates_left_and_right_retained(client):
+    """新区间落在旧版本中段：两侧残段按原费率与 reason 追加为补偿版本，窗口外报价不变。"""
+    post_rate(client, contract_no="R-1", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="初始费率")
+    r = post_rate(client, contract_no="R-1", rate=0.08,
+                  valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+                  recorded_at="2026-03-01T00:00:00Z", reason="二季度更正")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["created"]["version"] == 2
+    assert body["superseded_rate_ids"] == [1]
+    retained = body["retained_versions"]
+    assert len(retained) == 2
+    # 补偿片段按 valid_from 升序（左残段在前），version 严格递增
+    assert [(v["valid_from"], v["valid_to"], v["version"], v["rate"], v["reason"])
+            for v in retained] == [
+        ("2026-01-01T00:00:00.000000+00:00", "2026-04-01T00:00:00.000000+00:00",
+         3, 0.05, "初始费率"),
+        ("2026-07-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00",
+         4, 0.05, "初始费率"),
+    ]
+    for v in retained:
+        assert v["status"] == "current"
+        assert v["superseded_at"] is None
+        assert v["recorded_at"] == "2026-03-01T00:00:00.000000+00:00"
+
+    # 修订后认知时点：左残段 0.05 → 新区间 0.08 → 右残段 0.05，窗口外不产生 gap
+    def quote(valid_at):
+        return client.get("/quote", params={
+            "contract_no": "R-1", "valid_at": valid_at,
+            "known_at": "2026-03-02T00:00:00Z"}).json()
+
+    assert quote("2026-02-01T00:00:00Z")["rate"] == 0.05
+    assert quote("2026-02-01T00:00:00Z")["basis"]["version"] == 3
+    assert quote("2026-05-01T00:00:00Z")["rate"] == 0.08
+    assert quote("2026-05-01T00:00:00Z")["basis"]["version"] == 2
+    assert quote("2026-10-01T00:00:00Z")["rate"] == 0.05
+    assert quote("2026-10-01T00:00:00Z")["basis"]["version"] == 4
+
+    # 左闭右开边界：补偿残段与新区间恰好相接
+    boundary_new = client.get("/quote", params={
+        "contract_no": "R-1", "valid_at": "2026-04-01T00:00:00Z",
+        "known_at": "2026-03-02T00:00:00Z"}).json()
+    assert boundary_new["rate"] == 0.08
+    boundary_right = client.get("/quote", params={
+        "contract_no": "R-1", "valid_at": "2026-07-01T00:00:00Z",
+        "known_at": "2026-03-02T00:00:00Z"}).json()
+    assert boundary_right["basis"]["version"] == 4
+
+    # 修订前的历史认知时点：仍看到原版本 v1 的 0.05（即使落在新区间内）
+    old = client.get("/quote", params={
+        "contract_no": "R-1", "valid_at": "2026-05-01T00:00:00Z",
+        "known_at": "2026-02-01T00:00:00Z"}).json()
+    assert old["rate"] == 0.05
+    assert old["basis"]["version"] == 1
+
+    # 时间线：v1 被取代，v2 为新版本，v3/v4 为补偿版本，版本号严格递增
+    versions = _timeline(client, "R-1")
+    assert [v["version"] for v in versions] == [1, 2, 3, 4]
+    assert versions[0]["status"] == "superseded"
+    assert versions[0]["superseded_at"] == "2026-03-01T00:00:00.000000+00:00"
+    assert [v["status"] for v in versions[1:]] == ["current", "current", "current"]
+
+
+def test_middle_overlap_full_year_has_no_gap_in_coverage(client):
+    """修复回归：中段修订后覆盖率分析在全年窗口内不再出现 gap。"""
+    post_rate(client, contract_no="R-2", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="R-2", rate=0.09,
+              valid_from="2026-06-01T00:00:00Z", valid_to="2026-09-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z")
+    data = client.get("/contracts/R-2/coverage", params={
+        "from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+        "known_at": "2026-04-01T00:00:00Z"}).json()
+    segs = data["segments"]
+    assert [s["status"] for s in segs] == ["covered", "covered", "covered"]
+    assert [s["basis"]["rate"] for s in segs] == [0.05, 0.09, 0.05]
+    assert [(s["from"], s["to"]) for s in segs] == [
+        ("2026-01-01T00:00:00.000000+00:00", "2026-06-01T00:00:00.000000+00:00"),
+        ("2026-06-01T00:00:00.000000+00:00", "2026-09-01T00:00:00.000000+00:00"),
+        ("2026-09-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00"),
+    ]
+
+
+def test_revision_splits_open_ended_old_version(client):
+    """开放上界旧版本被有限新区间从中修订：左残段有限、右残段保持开放上界。"""
+    post_rate(client, contract_no="R-3", rate=0.07,
+              valid_from="2026-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="长期费率")
+    r = post_rate(client, contract_no="R-3", rate=0.09,
+                  valid_from="2026-06-01T00:00:00Z", valid_to="2026-09-01T00:00:00Z",
+                  recorded_at="2026-03-01T00:00:00Z", reason="暑期促销")
+    body = r.json()
+    assert body["superseded_rate_ids"] == [1]
+    retained = body["retained_versions"]
+    assert [(v["valid_from"], v["valid_to"], v["version"], v["rate"], v["reason"])
+            for v in retained] == [
+        ("2026-01-01T00:00:00.000000+00:00", "2026-06-01T00:00:00.000000+00:00",
+         3, 0.07, "长期费率"),
+        ("2026-09-01T00:00:00.000000+00:00", None,
+         4, 0.07, "长期费率"),
+    ]
+
+    def quote(valid_at):
+        return client.get("/quote", params={
+            "contract_no": "R-3", "valid_at": valid_at,
+            "known_at": "2026-03-02T00:00:00Z"}).json()
+
+    assert quote("2026-03-01T00:00:00Z")["basis"]["version"] == 3
+    assert quote("2026-07-01T00:00:00Z")["rate"] == 0.09
+    # 开放上界的右残段在遥远未来仍有效
+    far = quote("2099-01-01T00:00:00Z")
+    assert far["rate"] == 0.07
+    assert far["basis"]["version"] == 4
+    assert far["basis"]["valid_to"] is None
+
+
+def test_open_ended_new_overrides_bounded_old_tail(client):
+    """开放上界的新区间覆盖有限旧版本的尾部：只补左侧残段，右侧无限延伸。"""
+    post_rate(client, contract_no="R-4", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = post_rate(client, contract_no="R-4", rate=0.06,
+                  valid_from="2026-07-01T00:00:00Z",
+                  recorded_at="2026-03-01T00:00:00Z")
+    body = r.json()
+    assert body["superseded_rate_ids"] == [1]
+    assert body["created"]["valid_to"] is None
+    retained = body["retained_versions"]
+    assert len(retained) == 1
+    assert (retained[0]["valid_from"], retained[0]["valid_to"], retained[0]["version"]) == (
+        "2026-01-01T00:00:00.000000+00:00", "2026-07-01T00:00:00.000000+00:00", 3)
+
+    def quote(valid_at):
+        return client.get("/quote", params={
+            "contract_no": "R-4", "valid_at": valid_at,
+            "known_at": "2026-03-02T00:00:00Z"}).json()
+
+    assert quote("2026-03-01T00:00:00Z")["rate"] == 0.05
+    assert quote("2026-10-01T00:00:00Z")["rate"] == 0.06
+    assert quote("2099-01-01T00:00:00Z")["rate"] == 0.06
+
+
+def test_revision_covering_multiple_old_versions_with_retained(client):
+    """一次修订同时相交多条当前版本：各自未覆盖残段均补偿，按 valid_from 排序、版本递增。"""
+    post_rate(client, contract_no="R-5", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="R-5", rate=0.06,
+              valid_from="2026-06-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    # 新区间 [2026-03-01, 2026-10-01) 横跨两条旧版本
+    r = post_rate(client, contract_no="R-5", rate=0.09,
+                  valid_from="2026-03-01T00:00:00Z", valid_to="2026-10-01T00:00:00Z",
+                  recorded_at="2026-03-01T00:00:00Z")
+    body = r.json()
+    assert body["created"]["version"] == 3
+    assert body["superseded_rate_ids"] == [1, 2]
+    retained = body["retained_versions"]
+    # 旧 v1 补左残段 [01-01, 03-01)；旧 v2 补右残段 [10-01, 2027-01-01)
+    assert [(v["valid_from"], v["valid_to"], v["version"], v["rate"]) for v in retained] == [
+        ("2026-01-01T00:00:00.000000+00:00", "2026-03-01T00:00:00.000000+00:00",
+         4, 0.05),
+        ("2026-10-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00",
+         5, 0.06),
+    ]
+
+    def quote(valid_at):
+        return client.get("/quote", params={
+            "contract_no": "R-5", "valid_at": valid_at,
+            "known_at": "2026-03-02T00:00:00Z"}).json()
+
+    assert quote("2026-02-01T00:00:00Z")["rate"] == 0.05
+    assert quote("2026-05-01T00:00:00Z")["rate"] == 0.09
+    assert quote("2026-11-01T00:00:00Z")["rate"] == 0.06
+
+    # 修订后全年覆盖无 gap
+    data = client.get("/contracts/R-5/coverage", params={
+        "from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+        "known_at": "2026-03-02T00:00:00Z"}).json()
+    assert [s["status"] for s in data["segments"]] == ["covered", "covered", "covered"]
+    assert [s["basis"]["rate"] for s in data["segments"]] == [0.05, 0.09, 0.06]
+
+    versions = _timeline(client, "R-5")
+    assert [v["version"] for v in versions] == [1, 2, 3, 4, 5]
+    assert [v["status"] for v in versions] == [
+        "superseded", "superseded", "current", "current", "current"]
+
+    # 修订前的 known_at 仍看到原始两条版本
+    old = client.get("/contracts/R-5/coverage", params={
+        "from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+        "known_at": "2026-02-01T00:00:00Z"}).json()
+    assert [s["basis"]["version"] for s in old["segments"] if s["status"] == "covered"] == [1, 2]
+
+
+def test_touching_boundaries_create_no_retained(client):
+    """新区间与旧版本仅边界相接（不相交）：不取代、不补偿。"""
+    post_rate(client, contract_no="R-6", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = post_rate(client, contract_no="R-6", rate=0.08,
+                  valid_from="2026-06-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+                  recorded_at="2026-03-01T00:00:00Z")
+    body = r.json()
+    assert body["superseded_rate_ids"] == []
+    assert body["retained_versions"] == []
+    assert body["created"]["version"] == 2
+    versions = _timeline(client, "R-6")
+    assert all(v["status"] == "current" for v in versions)
+
+
+def test_revision_extends_beyond_old_interval(client):
+    """新区间起点早于旧版本：旧版本只补右残段，新区间之前本就无费率（保持 gap）。"""
+    post_rate(client, contract_no="R-7", rate=0.05,
+              valid_from="2026-04-01T00:00:00Z", valid_to="2026-10-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = post_rate(client, contract_no="R-7", rate=0.08,
+                  valid_from="2026-01-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+                  recorded_at="2026-03-01T00:00:00Z")
+    body = r.json()
+    assert body["superseded_rate_ids"] == [1]
+    retained = body["retained_versions"]
+    assert len(retained) == 1
+    assert (retained[0]["valid_from"], retained[0]["valid_to"]) == (
+        "2026-07-01T00:00:00.000000+00:00", "2026-10-01T00:00:00.000000+00:00")
+    assert retained[0]["rate"] == 0.05
+
+    def quote(valid_at):
+        return client.get("/quote", params={
+            "contract_no": "R-7", "valid_at": valid_at,
+            "known_at": "2026-03-02T00:00:00Z"})
+
+    # 新区间之前本来就没有费率，仍是 404，而不是错误补偿
+    assert quote("2025-12-01T00:00:00Z").status_code == 404
+    assert quote("2026-02-01T00:00:00Z").json()["rate"] == 0.08
+    assert quote("2026-05-01T00:00:00Z").json()["rate"] == 0.08
+    assert quote("2026-08-01T00:00:00Z").json()["rate"] == 0.05
+
+
+def test_charge_preview_uses_retained_versions(client):
+    """中段修订后，账单行跨三段计价：补偿残段沿用原费率，行可完整计价。"""
+    post_rate(client, contract_no="R-8", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="R-8", rate=0.08,
+              valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z")
+    data = post_preview(client, "R-8", known_at="2026-04-01T00:00:00Z", lines=[
+        {"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+         "base_amount": 1200.0},
+    ]).json()
+    assert data["status"] == "ok"
+    (line,) = data["lines"]
+    assert line["status"] == "ok"
+    assert [(s["status"], s["rate"]) for s in line["segments"]] == [
+        ("covered", 0.05), ("covered", 0.08), ("covered", 0.05)]
+    assert [s["rate_id"] for s in line["segments"]] == [3, 2, 4]
 
 
 def test_recorded_at_must_be_monotonic(client):
@@ -316,16 +586,20 @@ def test_coverage_reflects_known_at(client):
     assert [(s["status"], s["basis"]["version"] if s["basis"] else None)
             for s in old["segments"]] == [("covered", 1)]
 
-    # 修订后的认知时点：旧版本已被取代，上半年变为 gap，下半年为新版本
+    # 修订后的认知时点：下半年被新版本覆盖；上半年不在新区间内，由补偿版本
+    # 按原费率 0.05 承接，不再是 gap
     new = client.get("/contracts/CV-3/coverage", params={
         "from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
         "known_at": "2026-03-02T00:00:00Z"}).json()
     assert [(s["from"], s["status"]) for s in new["segments"]] == [
-        ("2026-01-01T00:00:00.000000+00:00", "gap"),
+        ("2026-01-01T00:00:00.000000+00:00", "covered"),
         ("2026-06-01T00:00:00.000000+00:00", "covered"),
     ]
-    assert new["segments"][1]["basis"]["version"] == 2
-    assert new["segments"][1]["basis"]["rate"] == 0.08
+    retained, revised = new["segments"]
+    assert retained["basis"]["version"] == 3
+    assert retained["basis"]["rate"] == 0.05
+    assert revised["basis"]["version"] == 2
+    assert revised["basis"]["rate"] == 0.08
 
 
 def test_coverage_multiple_versions_segmentation(client):
