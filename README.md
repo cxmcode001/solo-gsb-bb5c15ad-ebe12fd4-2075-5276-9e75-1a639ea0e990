@@ -37,6 +37,16 @@ docker compose up --build
 修订 = 插入新版本（`version` 递增）并把区间重叠的旧版本置上 `superseded_at`，
 旧行不修改、不删除，任意历史认知时点均可回放。
 
+**部分重叠只替换交集（v1.2 起）**：当新区间 `[valid_from, valid_to)` 只压住
+某条当前版本的一部分时，旧版本仅在交集内被取代；交集之外未被覆盖的
+**左段 `[old.valid_from, valid_from)`、右段 `[valid_to, old.valid_to)`** 会按
+旧版本的**原费率与原 `reason`** 追加为新的“补偿版本”。修订窗口之外的报价因此
+保持不变，不会凭空产生 gap；旧版本开放上界（`valid_to` 缺省）时，右补偿片段
+同样开放上界。一次修订同时覆盖多条旧版本时，每条各自保留窗口外侧片段。
+
+取代标记、新版本与补偿版本在**同一事务**提交：先创建新费率（取得最小的新
+版本号），补偿片段再按 `valid_from` 排序紧随其后，`version` 严格递增。
+
 ## 接口
 
 ### 1. 录入 / 修订费率 — `POST /rates`
@@ -55,9 +65,32 @@ curl -X POST http://localhost:8000/rates \
 ```
 
 - `valid_to`、`recorded_at`、`reason` 均可选；`recorded_at` 缺省为当前时间。
-- 与当前版本区间重叠时自动修订：响应中 `superseded_rate_ids` 列出被取代版本。
+- 与当前版本区间重叠时自动修订：响应中 `superseded_rate_ids` 列出被取代版本，
+  `retained_versions` 列出窗口外保留的补偿版本（原费率、原 `reason`，按
+  `valid_from` 排序；完整覆盖或无重叠时为空列表）。
+- 部分重叠只替换交集：左、右未覆盖部分追加为补偿版本，修订窗口外报价不变；
+  历史 `known_at` 仍可看到未被切分的原版本（见下文“双时态模型”）。
 - 同一合同 `recorded_at` 必须单调递增，否则 `422 NON_MONOTONIC_RECORDED_AT`；
   `valid_to <= valid_from` 返回 `422 INVALID_INTERVAL`。
+
+部分重叠修订的响应示例（原费率 0.05 覆盖全年，新费率 0.09 只替换 4–6 月）：
+
+```json
+{
+  "created": {"rate_id": 2, "rate": 0.09, "version": 2,
+              "valid_from": "2026-04-01T00:00:00.000000+00:00",
+              "valid_to": "2026-07-01T00:00:00.000000+00:00", "status": "current"},
+  "superseded_rate_ids": [1],
+  "retained_versions": [
+    {"rate_id": 3, "rate": 0.05, "version": 3,
+     "valid_from": "2026-01-01T00:00:00.000000+00:00",
+     "valid_to": "2026-04-01T00:00:00.000000+00:00", "status": "current", "reason": "原费率"},
+    {"rate_id": 4, "rate": 0.05, "version": 4,
+     "valid_from": "2026-07-01T00:00:00.000000+00:00",
+     "valid_to": "2027-01-01T00:00:00.000000+00:00", "status": "current", "reason": "原费率"}
+  ]
+}
+```
 
 ### 2. 报价 — `GET /quote`
 
@@ -103,7 +136,7 @@ curl "http://localhost:8000/contracts/HT-2026-001/coverage?from=2026-01-01T00:00
 `from >= to` 返回 `422 INVALID_INTERVAL`；该认知时点下无任何可见版本时，
 返回一个覆盖整个查询窗口的 `gap` 片段（合同不存在亦然，不报 404）。
 
-响应示例（上半年已被修订取代、下半年被新版本覆盖）：
+响应示例（上半年为旧费率的补偿版本、下半年为修订后的新版本，全年连续无 gap）：
 
 ```json
 {
@@ -113,7 +146,8 @@ curl "http://localhost:8000/contracts/HT-2026-001/coverage?from=2026-01-01T00:00
   "known_at": "2026-06-01T00:00:00.000000+00:00",
   "segments": [
     {"from": "2026-01-01T00:00:00.000000+00:00", "to": "2026-06-01T00:00:00.000000+00:00",
-     "status": "gap", "basis": null, "candidates": []},
+     "status": "covered", "basis": {"rate_id": 3, "rate": 0.052, "version": 3, "...": "..."},
+     "candidates": []},
     {"from": "2026-06-01T00:00:00.000000+00:00", "to": "2027-01-01T00:00:00.000000+00:00",
      "status": "covered", "basis": {"rate_id": 2, "rate": 0.058, "version": 2, "...": "..."},
      "candidates": []}

@@ -4,7 +4,8 @@
 - 业务时间（valid time）  [valid_from, valid_to)：费率在现实中生效的区间，左闭右开；
 - 系统时间（system time） [recorded_at, superseded_at)：该记录被系统认知为真的区间，左闭右开。
 
-修订 = 追加新版本并把被覆盖的旧版本标记 superseded_at，历史行永不修改、永不删除。
+修订 = 追加新版本并把被覆盖旧版本的交集标记 superseded_at，交集之外的左、右
+部分按原费率与 reason 追加补偿版本；历史行永不修改、永不删除。
 """
 
 import math
@@ -43,13 +44,19 @@ def record_rate(
     recorded_at: Optional[datetime],
     reason: Optional[str],
     conn: Optional[sqlite3.Connection] = None,
-) -> tuple[sqlite3.Row, list[int]]:
+) -> tuple[sqlite3.Row, list[int], list[sqlite3.Row]]:
     """录入费率（追加式）。
 
-    若新区间与当前认知中（superseded_at IS NULL）的既有版本重叠，
-    则将重叠旧版本在 recorded_at 时刻标记为被取代，再插入新版本。
+    若新区间 [vf, vt) 与当前认知中（superseded_at IS NULL）的既有版本重叠，
+    仅用新版本替换交集部分：每条被覆盖的旧版本在 recorded_at 时刻标记被取代，
+    交集之外未被覆盖的左段 [old.vf, vf)、右段 [vt, old.vt)（含开放上界情形）
+    按旧版本原费率与 reason 追加为补偿版本。因此修订窗口之外的报价保持不变，
+    不会产生 gap。
 
-    返回 (新版本行, 被取代的版本 id 列表)。
+    取代标记、新版本、补偿版本在同一事务内完成；版本号严格递增，新版本在前，
+    补偿片段按 valid_from 排序（同点按被覆盖版本的原始顺序）在后。
+
+    返回 (新版本行, 被取代的版本 id 列表, 补偿版本行列表)。
     """
     vf = iso(valid_from)
     vt = iso(valid_to) if valid_to is not None else None
@@ -74,13 +81,61 @@ def record_rate(
             )
 
         overlaps = conn.execute(
-            "SELECT id FROM rate_versions "
+            "SELECT * FROM rate_versions "
             "WHERE contract_no = ? AND superseded_at IS NULL "
             "  AND valid_from < COALESCE(?, ?) "
-            "  AND COALESCE(valid_to, ?) > ?",
+            "  AND COALESCE(valid_to, ?) > ? "
+            "ORDER BY valid_from ASC, id ASC",
             (contract_no, vt, INF, INF, vf),
         ).fetchall()
 
+        # 逐条计算交集之外的补偿片段：(valid_from, valid_to, 源顺序, 旧版本行)。
+        # 左段严格以 vf 为终点、右段严格以 vt 为起点，故片段必非空；
+        # 新区间开放上界（vt IS NULL）时不存在右段。
+        pieces: list[tuple[str, Optional[str], int, sqlite3.Row]] = []
+        for order, old in enumerate(overlaps):
+            if old["valid_from"] < vf:
+                pieces.append((old["valid_from"], vf, order, old))
+            if vt is not None and (old["valid_to"] is None or vt < old["valid_to"]):
+                pieces.append((vt, old["valid_to"], order, old))
+        pieces.sort(key=lambda p: (p[0], p[2]))
+
+        # 先创建新费率，version 严格递增；补偿片段按 valid_from 顺序紧随其后。
+        next_version = state["max_v"] + 1
+        cursor = conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (contract_no, rate, vf, vt, ra, next_version, reason),
+        )
+        new_row = conn.execute(
+            "SELECT * FROM rate_versions WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+
+        retained_rows: list[sqlite3.Row] = []
+        for piece_vf, piece_vt, _, old in pieces:
+            piece_cursor = conn.execute(
+                "INSERT INTO rate_versions "
+                "(contract_no, rate, valid_from, valid_to, recorded_at, version, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    contract_no,
+                    old["rate"],
+                    piece_vf,
+                    piece_vt,
+                    ra,
+                    next_version + 1 + len(retained_rows),
+                    old["reason"],
+                ),
+            )
+            retained_rows.append(
+                conn.execute(
+                    "SELECT * FROM rate_versions WHERE id = ?",
+                    (piece_cursor.lastrowid,),
+                ).fetchone()
+            )
+
+        # 取代标记与新增行在同一事务提交，任一失败整体回滚。
         superseded_ids = [row["id"] for row in overlaps]
         for version_id in superseded_ids:
             conn.execute(
@@ -88,19 +143,13 @@ def record_rate(
                 (ra, version_id),
             )
 
-        cursor = conn.execute(
-            "INSERT INTO rate_versions "
-            "(contract_no, rate, valid_from, valid_to, recorded_at, version, reason) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (contract_no, rate, vf, vt, ra, state["max_v"] + 1, reason),
-        )
-        new_row = conn.execute(
-            "SELECT * FROM rate_versions WHERE id = ?", (cursor.lastrowid,)
-        ).fetchone()
-
         if own_conn:
             conn.commit()
-        return new_row, superseded_ids
+        return new_row, superseded_ids, retained_rows
+    except Exception:
+        if own_conn:
+            conn.rollback()
+        raise
     finally:
         if own_conn:
             conn.close()

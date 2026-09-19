@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.1.0",
+    version="1.2.0",
     description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史。",
     lifespan=lifespan,
 )
@@ -57,6 +57,10 @@ class VersionView(BaseModel):
 class RateCreated(BaseModel):
     created: VersionView
     superseded_rate_ids: list[int]
+    retained_versions: list[VersionView] = Field(
+        default_factory=list,
+        description="部分重叠修订时，被覆盖旧版本在新区间之外的左/右补偿版本（原费率、原 reason），按 valid_from 排序",
+    )
 
 
 class QuoteResponse(BaseModel):
@@ -177,9 +181,10 @@ def health():
 
 @app.post("/rates", response_model=RateCreated, status_code=status.HTTP_201_CREATED)
 def create_rate(payload: RateCreate):
-    """录入费率。与既有当前版本区间重叠时自动修订：旧版本标记取代、追加新版本，历史保留。"""
+    """录入费率。与既有当前版本区间重叠时自动修订：旧版本仅交集被替换，
+    交集之外的左、右部分按原费率与 reason 追加为补偿版本，历史保留、窗口外报价不变。"""
     try:
-        row, superseded_ids = logic.record_rate(
+        row, superseded_ids, retained_rows = logic.record_rate(
             contract_no=payload.contract_no,
             rate=payload.rate,
             valid_from=payload.valid_from,
@@ -197,7 +202,11 @@ def create_rate(payload: RateCreate):
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "NON_MONOTONIC_RECORDED_AT", "message": str(exc)},
         )
-    return RateCreated(created=to_view(row), superseded_rate_ids=superseded_ids)
+    return RateCreated(
+        created=to_view(row),
+        superseded_rate_ids=superseded_ids,
+        retained_versions=[to_view(r) for r in retained_rows],
+    )
 
 
 @app.get("/quote", response_model=QuoteResponse)
